@@ -128,7 +128,7 @@ def init_session() -> None:
     defaults = {
         "authenticated": False,
         "user": {},
-        "view": "Login",
+        "view": "About",
         "flash": "",
         "show_welcome": False,
     }
