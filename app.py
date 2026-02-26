@@ -33,13 +33,14 @@ def normalize_artifact(artifact):
         columns = artifact.get("feature_columns", [])
         schema = artifact.get("feature_schema", {})
         metrics = artifact.get("metrics", {})
+        external_test_metrics = artifact.get("external_test_metrics")
 
         if not columns:
             columns = list(schema.keys())
         if not schema:
             schema = default_schema(columns)
 
-        return model, columns, schema, metrics
+        return model, columns, schema, metrics, external_test_metrics
 
     fallback_columns = ["area", "bedrooms", "bathrooms", "floors", "age"]
     fallback_schema = {
@@ -49,7 +50,7 @@ def normalize_artifact(artifact):
         "floors": {"type": "numeric", "min": 1.0, "max": 4.0, "default": 2.0},
         "age": {"type": "numeric", "min": 0.0, "max": 70.0, "default": 15.0},
     }
-    return artifact, fallback_columns, fallback_schema, {}
+    return artifact, fallback_columns, fallback_schema, {}, None
 
 
 def get_feature_importance_frame(model) -> pd.DataFrame | None:
@@ -68,12 +69,23 @@ def get_feature_importance_frame(model) -> pd.DataFrame | None:
         return None
 
 
+def is_integer_feature(feature: str, meta: dict[str, object]) -> bool:
+    if bool(meta.get("is_integer", False)):
+        return True
+
+    name = feature.lower()
+    # Force common count-style inputs to integer in UI.
+    return ("bedroom" in name) or ("bathroom" in name)
+
+
 def render_inputs(feature_columns: list[str], schema: dict[str, dict]) -> dict[str, object]:
     user_values: dict[str, object] = {}
     left_col, right_col = st.columns(2)
 
     for idx, feature in enumerate(feature_columns):
-        meta = schema.get(feature, {"type": "numeric", "min": 0.0, "max": 10000.0, "default": 0.0})
+        meta = schema.get(
+            feature, {"type": "numeric", "min": 0.0, "max": 10000.0, "default": 0.0}
+        )
         label = feature.replace("_", " ").title()
         target_col = left_col if idx % 2 == 0 else right_col
 
@@ -96,17 +108,33 @@ def render_inputs(feature_columns: list[str], schema: dict[str, dict]) -> dict[s
                 default_value = float(meta.get("default", (min_value + max_value) / 2))
                 if max_value <= min_value:
                     max_value = min_value + 1.0
-                default_value = min(max(default_value, min_value), max_value)
 
-                step = 1.0 if (max_value - min_value) >= 10 else 0.1
-                user_values[feature] = st.number_input(
-                    label,
-                    min_value=min_value,
-                    max_value=max_value,
-                    value=default_value,
-                    step=step,
-                    key=f"input_{feature}",
-                )
+                if is_integer_feature(feature, meta):
+                    min_int = int(round(min_value))
+                    max_int = int(round(max_value))
+                    default_int = int(round(default_value))
+                    if max_int <= min_int:
+                        max_int = min_int + 1
+                    default_int = min(max(default_int, min_int), max_int)
+
+                    user_values[feature] = st.number_input(
+                        label,
+                        min_value=min_int,
+                        max_value=max_int,
+                        value=default_int,
+                        step=1,
+                        key=f"input_{feature}",
+                    )
+                else:
+                    step = 1.0 if (max_value - min_value) >= 10 else 0.1
+                    user_values[feature] = st.number_input(
+                        label,
+                        min_value=min_value,
+                        max_value=max_value,
+                        value=default_value,
+                        step=step,
+                        key=f"input_{feature}",
+                    )
 
     return user_values
 
@@ -127,7 +155,9 @@ if not MODEL_PATH.exists():
     st.stop()
 
 artifact = load_artifact(MODEL_PATH)
-model, feature_columns, feature_schema, metrics = normalize_artifact(artifact)
+model, feature_columns, feature_schema, metrics, external_test_metrics = normalize_artifact(
+    artifact
+)
 
 if not feature_columns:
     st.error("No feature columns found in model artifact.")
@@ -152,6 +182,9 @@ with tab_predict:
         if metrics:
             st.write(f"Model RMSE: {metrics.get('rmse', float('nan')):,.2f}")
             st.write(f"Model R2: {metrics.get('r2', float('nan')):.4f}")
+        if external_test_metrics:
+            st.write("External Test RMSE:", f"{external_test_metrics.get('rmse', float('nan')):,.2f}")
+            st.write("External Test R2:", f"{external_test_metrics.get('r2', float('nan')):.4f}")
 
 with tab_what_if:
     st.subheader("Scenario Simulation")

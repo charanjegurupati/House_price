@@ -29,11 +29,18 @@ pip install -r requirements.txt
 python train.py --data-path data/housing.csv --model-path model.pkl
 ```
 
+With external test data (example path from Downloads):
+
+```bash
+python train.py --data-path data/housing.csv --test-data-path "C:\Users\chara\Downloads\archive (1)\Housing.csv" --model-path model.pkl
+```
+
 What this does:
 - Loads your CSV (`price` is target)
 - Handles missing values
 - One-hot encodes categorical columns
 - Trains a `RandomForestRegressor`
+- Optionally evaluates on external test CSV
 - Saves `model.pkl` with metadata for the Streamlit app
 
 ## 3. Run App Locally

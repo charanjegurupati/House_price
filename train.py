@@ -25,10 +25,15 @@ def build_feature_schema(features: pd.DataFrame) -> dict[str, dict]:
             clean = series.dropna()
             if clean.empty:
                 col_min, col_max, col_default = 0.0, 1.0, 0.0
+                is_integer = False
             else:
                 col_min = float(clean.min())
                 col_max = float(clean.max())
                 col_default = float(clean.median())
+                clean_as_float = clean.to_numpy(dtype=float)
+                is_integer = bool(
+                    np.all(np.isclose(clean_as_float, np.round(clean_as_float)))
+                )
 
             if col_min == col_max:
                 col_max = col_min + 1.0
@@ -38,6 +43,7 @@ def build_feature_schema(features: pd.DataFrame) -> dict[str, dict]:
                 "min": round(col_min, 4),
                 "max": round(col_max, 4),
                 "default": round(col_default, 4),
+                "is_integer": is_integer,
             }
         else:
             options = sorted(series.dropna().astype(str).unique().tolist())
@@ -71,6 +77,12 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="model.pkl",
         help="Path to save model artifact.",
+    )
+    parser.add_argument(
+        "--test-data-path",
+        type=str,
+        default="",
+        help="Optional CSV path for external test evaluation.",
     )
     parser.add_argument(
         "--test-size",
@@ -163,12 +175,71 @@ def main() -> None:
     rmse = float(np.sqrt(mean_squared_error(y_test, preds)))
     r2 = float(r2_score(y_test, preds))
 
+    external_test_metrics: dict[str, float | int | str] | None = None
+    if args.test_data_path:
+        test_data_path = Path(args.test_data_path)
+        if not test_data_path.exists():
+            print(
+                f"Warning: external test file not found at {test_data_path}. "
+                "Skipping external test evaluation."
+            )
+        else:
+            ext_df = pd.read_csv(test_data_path)
+            if args.target not in ext_df.columns:
+                print(
+                    f"Warning: external test data is missing target '{args.target}'. "
+                    "Skipping external test evaluation."
+                )
+            else:
+                ext_df = ext_df.dropna(subset=[args.target]).copy()
+                if ext_df.empty:
+                    print(
+                        "Warning: no rows available in external test data after "
+                        "dropping missing target values."
+                    )
+                else:
+                    ext_x = ext_df.drop(columns=[args.target]).copy()
+                    expected_columns = x.columns.tolist()
+
+                    missing_cols = [c for c in expected_columns if c not in ext_x.columns]
+                    extra_cols = [c for c in ext_x.columns if c not in expected_columns]
+
+                    for col in missing_cols:
+                        ext_x[col] = np.nan
+                    if extra_cols:
+                        ext_x = ext_x.drop(columns=extra_cols)
+
+                    ext_x = ext_x[expected_columns]
+                    ext_y = ext_df[args.target]
+                    ext_preds = model.predict(ext_x)
+
+                    ext_rmse = float(np.sqrt(mean_squared_error(ext_y, ext_preds)))
+                    ext_r2 = float(r2_score(ext_y, ext_preds))
+                    external_test_metrics = {
+                        "rows": int(len(ext_df)),
+                        "rmse": ext_rmse,
+                        "r2": ext_r2,
+                        "path": str(test_data_path),
+                    }
+
+                    if missing_cols:
+                        print(
+                            "External test data had missing feature columns filled with NaN: "
+                            + ", ".join(missing_cols)
+                        )
+                    if extra_cols:
+                        print(
+                            "External test data had extra columns ignored: "
+                            + ", ".join(extra_cols)
+                        )
+
     artifact = {
         "model": model,
         "feature_columns": x.columns.tolist(),
         "feature_schema": build_feature_schema(x),
         "target": args.target,
         "metrics": {"rmse": rmse, "r2": r2},
+        "external_test_metrics": external_test_metrics,
         "created_at_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
     }
 
@@ -181,6 +252,12 @@ def main() -> None:
     print(f"Features: {len(x.columns)}")
     print(f"RMSE: {rmse:.2f}")
     print(f"R2: {r2:.4f}")
+    if external_test_metrics is not None:
+        print("External Test Evaluation:")
+        print(f"Rows: {external_test_metrics['rows']}")
+        print(f"RMSE: {external_test_metrics['rmse']:.2f}")
+        print(f"R2: {external_test_metrics['r2']:.4f}")
+        print(f"Source: {external_test_metrics['path']}")
     print(f"Model artifact saved to: {model_path.resolve()}")
 
 
