@@ -9,7 +9,15 @@ from uuid import uuid4
 
 import streamlit as st
 
-from .constants import SESSION_STORE_PATH, USERS_PATH
+from .constants import SESSION_STORE_PATH
+from .user_store import (
+    create_user,
+    email_exists,
+    find_user_by_identity,
+    get_user_by_username,
+    init_user_store,
+    username_exists,
+)
 
 SESSION_TTL_SECONDS = 60 * 60 * 24 * 30
 
@@ -22,30 +30,23 @@ def valid_email(email: str) -> bool:
     return bool(re.fullmatch(r"[^@]+@[^@]+\.[^@]+", email))
 
 
-def load_users() -> dict[str, dict]:
-    if not USERS_PATH.exists():
-        return {}
-    try:
-        return json.loads(USERS_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-
-def save_users(users: dict[str, dict]) -> None:
-    USERS_PATH.write_text(json.dumps(users, indent=2), encoding="utf-8")
-
-
 def load_sessions() -> dict[str, dict]:
     if not SESSION_STORE_PATH.exists():
         return {}
     try:
-        return json.loads(SESSION_STORE_PATH.read_text(encoding="utf-8"))
+        raw = SESSION_STORE_PATH.read_text(encoding="utf-8").strip()
+        if not raw:
+            return {}
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else {}
     except Exception:
         return {}
 
 
 def save_sessions(sessions: dict[str, dict]) -> None:
-    SESSION_STORE_PATH.write_text(json.dumps(sessions, indent=2), encoding="utf-8")
+    tmp_path = SESSION_STORE_PATH.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(sessions, indent=2), encoding="utf-8")
+    tmp_path.replace(SESSION_STORE_PATH)
 
 
 def cleanup_sessions(sessions: dict[str, dict]) -> dict[str, dict]:
@@ -108,8 +109,7 @@ def restore_auth_from_query() -> None:
         st.query_params.clear()
         return
 
-    users = load_users()
-    profile = users.get(username)
+    profile = get_user_by_username(username)
     if not profile:
         remove_session(sid)
         st.query_params.clear()
@@ -117,7 +117,7 @@ def restore_auth_from_query() -> None:
 
     st.session_state["authenticated"] = True
     st.session_state["user"] = {
-        "username": username,
+        "username": profile.get("username", username),
         "name": profile.get("name", username),
         "email": profile.get("email", ""),
     }
@@ -131,10 +131,18 @@ def init_session() -> None:
         "view": "About",
         "flash": "",
         "show_welcome": False,
+        "auth_store_error": "",
     }
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
+
+    try:
+        init_user_store()
+    except Exception:
+        st.session_state["auth_store_error"] = (
+            "User store initialization failed. Check write permissions for users.db."
+        )
 
 
 def render_sidebar() -> None:
@@ -192,6 +200,10 @@ def render_login() -> None:
         unsafe_allow_html=True,
     )
 
+    if st.session_state.get("auth_store_error"):
+        st.error(st.session_state["auth_store_error"])
+        return
+
     if st.session_state.get("flash"):
         st.success(st.session_state["flash"])
         st.session_state["flash"] = ""
@@ -204,30 +216,23 @@ def render_login() -> None:
     if not submit:
         return
 
-    users = load_users()
-    ident = identity.strip().lower()
-    matched: tuple[str, dict] | None = None
-    for uname, profile in users.items():
-        if ident == uname.lower() or ident == str(profile.get("email", "")).lower():
-            matched = (uname, profile)
-            break
-
-    if not matched:
+    profile = find_user_by_identity(identity)
+    if not profile:
         st.error("User not found.")
         return
 
-    uname, profile = matched
-    if hash_password(password) != profile.get("password_hash", ""):
+    if hash_password(password) != str(profile.get("password_hash", "")):
         st.error("Incorrect password.")
         return
 
+    username = str(profile.get("username", "")).strip()
     st.session_state["authenticated"] = True
     st.session_state["user"] = {
-        "username": uname,
-        "name": profile.get("name", uname),
+        "username": username,
+        "name": profile.get("name", username),
         "email": profile.get("email", ""),
     }
-    sid = create_session(uname)
+    sid = create_session(username)
     st.query_params["sid"] = sid
     st.session_state["show_welcome"] = True
     st.session_state["view"] = "Home"
@@ -245,6 +250,10 @@ def render_signup() -> None:
         unsafe_allow_html=True,
     )
 
+    if st.session_state.get("auth_store_error"):
+        st.error(st.session_state["auth_store_error"])
+        return
+
     with st.form("signup_form", clear_on_submit=True):
         name = st.text_input("Full Name")
         username = st.text_input("Username")
@@ -256,7 +265,6 @@ def render_signup() -> None:
     if not submit:
         return
 
-    users = load_users()
     uname = username.strip().lower()
     clean_name = name.strip()
     clean_email = email.strip().lower()
@@ -267,13 +275,13 @@ def render_signup() -> None:
     if not uname:
         st.error("Username is required.")
         return
-    if uname in users:
+    if username_exists(uname):
         st.error("Username already exists.")
         return
     if not valid_email(clean_email):
         st.error("Enter a valid email.")
         return
-    if any(str(u.get("email", "")).lower() == clean_email for u in users.values()):
+    if email_exists(clean_email):
         st.error("Email already used.")
         return
     if len(password) < 6:
@@ -283,13 +291,18 @@ def render_signup() -> None:
         st.error("Passwords do not match.")
         return
 
-    users[uname] = {
-        "name": clean_name,
-        "email": clean_email,
-        "password_hash": hash_password(password),
-        "created_at_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
-    }
-    save_users(users)
+    created = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    ok = create_user(
+        username=uname,
+        name=clean_name,
+        email=clean_email,
+        password_hash=hash_password(password),
+        created_at_utc=created,
+    )
+    if not ok:
+        st.error("Account could not be created. Try a different username/email.")
+        return
+
     st.session_state["view"] = "Login"
     st.session_state["flash"] = "Registration successful. Please login."
     st.rerun()

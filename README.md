@@ -78,6 +78,7 @@ git push -u origin main
 - What-if simulator for numeric features
 - Scenario-based trend projection
 - Model feature importance chart
+- Login/Signup with SQLite-backed user storage (`users.db`)
 
 ## Common Fixes
 
